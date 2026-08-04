@@ -1,127 +1,136 @@
-"""
-Generate a synthetic run-to-failure dataset in the NASA C-MAPSS FD001 format.
+# Turbofan Remaining Useful Life (RUL)
 
-WHY THIS EXISTS
----------------
-The real NASA C-MAPSS turbofan degradation data is public but must be downloaded
-separately (see data/README.md). To keep this repository clonable and runnable in
-one command, this script produces a *synthetic* dataset with the exact same schema
-and file names as C-MAPSS FD001. The degradation physics are simplified but
-realistic: each engine has a hidden health state that decays with accelerating
-wear, and sensors respond to that health plus operating conditions and noise.
-Several sensors are intentionally flat, mirroring the real data, so the feature
-selection step has something real to do.
+Forecasting how many operating cycles a jet engine has left before it fails, on
+the NASA C-MAPSS degradation benchmark. Built as a full pipeline: a governed SQL
+data layer, machine learning models, a Bayesian model that reports its own
+uncertainty, and a classical reliability / survival analysis in R.
 
-To use the REAL data instead, drop the official
-train_FD001.txt / test_FD001.txt / RUL_FD001.txt into this folder (same names).
-Everything downstream is format-identical and will just work.
+This is a predictive maintenance (Condition Based Maintenance, CBM+) problem: the
+kind of Prognostics and Health Management work used to decide when to service a
+component based on evidence of wear rather than a fixed calendar.
 
-The generator is deterministic (fixed seed) so results are reproducible.
-"""
+---
 
-import numpy as np
-import os
+## Overview
 
-SEED = 42
-N_TRAIN_UNITS = 100
-N_TEST_UNITS = 100
-HERE = os.path.dirname(os.path.abspath(__file__))
+Every engine in the dataset is observed cycle by cycle through 21 sensors. In the
+training set the engines run all the way to failure, so I can look back and label
+each moment with its true Remaining Useful Life. The goal is to learn that
+mapping and then, for a set of engines observed only partway through life,
+predict how much life remains, and say how confident that prediction is.
 
-# 3 operational settings + 21 sensors, matching C-MAPSS FD001 columns.
-N_OP = 3
-N_SENSORS = 21
+---
 
-# Which sensors carry a real degradation trend vs. flat/noise-only.
-# In real FD001, roughly 7 sensors are effectively constant; we mirror that.
-TRENDING_UP = [2, 3, 4, 8, 11, 13, 15, 17]      # rise as the engine degrades
-TRENDING_DOWN = [7, 9, 12, 14, 20, 21]          # fall as the engine degrades
-FLAT = [1, 5, 6, 10, 16, 18, 19]                # near-constant (uninformative)
+## Why I built it this way
 
+I wanted this to reflect how the problem is actually solved, not just fit one
+model to a table. A few decisions drove the design.
 
-def _health_curve(life, exponent):
-    """Hidden health index from 1.0 (new) to ~0.0 (failed), accelerating wear.
-    The exponent varies per engine, so degradation shape is not identical."""
-    t = np.arange(1, life + 1)
-    frac = t / life
-    degradation = frac ** exponent
-    return 1.0 - degradation  # 1 -> 0
+**I started with the data layer, not the model.** The raw sensor logs go into a
+SQLite database, and the RUL label is computed in SQL as `max_cycle - cycle`.
+Doing the labeling and the train / test / lifetime views declaratively keeps the
+data preparation auditable and hands clean tables to everything downstream. On a
+system meant to run for decades, the architecture matters more than any single
+model, so I treated it as the foundation.
 
+**I used three model families on purpose.** Reliability statistics, machine
+learning, and a Bayesian model each answer a slightly different question, and a
+real program needs all three. The tree models learn the sensor to RUL mapping
+without assuming any physics. The Weibull survival model describes how the whole
+population fails. The Bayesian model gives a distribution rather than a single
+number. Seeing where they agree and disagree is more honest than trusting one.
 
-def _make_unit(unit_id, life, rng):
-    # Per-unit variation so engines are not interchangeable.
-    exponent = rng.uniform(1.6, 2.6)
-    health = _health_curve(life, exponent)
-    cycles = np.arange(1, life + 1)
+**I scored for the real cost of being wrong.** RMSE treats a late prediction and
+an early one as equally bad. They are not. Predicting that an engine has more life
+than it really does can mean a missed failure, which on a critical system is far
+worse than servicing a little early. So alongside RMSE I use the asymmetric NASA
+prognostic score, which penalizes late predictions more heavily. The model choice
+should follow the cost, not the other way around.
 
-    # Operating settings: mild regime variation around FD001-like values.
-    op1 = rng.normal(0.0, 0.0025, life)
-    op2 = rng.normal(0.0, 0.00025, life)
-    op3 = np.full(life, 100.0)
+**I treated uncertainty as part of the answer.** A maintainer plans against a
+confidence bound, not a point. The Bayesian model returns a mean and a spread for
+every engine, and I check whether those intervals are actually calibrated. Where
+they are not, I say so in the results rather than hide it. Knowing the limits of
+a model is part of using it responsibly.
 
-    cols = [np.full(life, unit_id), cycles, op1, op2, op3]
+**I made it fully reproducible.** The repo includes the real, public NASA C-MAPSS
+FD001 data, so anyone can clone and run the whole pipeline in one command and get
+the numbers below. A synthetic data generator in the same schema is also included
+for quick offline experiments, but the default and the reported results are the
+real data.
 
-    wear = 1.0 - health                   # 0 -> 1
-    for s in range(1, N_SENSORS + 1):
-        # per-unit baseline offset (manufacturing/unit-to-unit spread)
-        base = 100.0 + s * 7.0 + rng.normal(0.0, 3.0)
-        if s in TRENDING_UP:
-            amp = 9.0 + (s % 5)
-            noise = rng.normal(0.0, 2.5, life)
-            sig = base + amp * wear + noise
-        elif s in TRENDING_DOWN:
-            amp = 8.0 + (s % 4)
-            noise = rng.normal(0.0, 2.5, life)
-            sig = base - amp * wear + noise
-        else:  # FLAT (uninformative)
-            sig = base + rng.normal(0.0, 0.3, life)
-        cols.append(sig)
+---
 
-    return np.column_stack(cols)
+## Architecture
 
+```
+data/                      SQL layer                 modeling                    reliability
+─────────                  ─────────────────          ────────────────────        ─────────────
+train/test/RUL   ──▶  SQLite: sensor_readings   ──▶  Python: RF, HistGBM     ──▶  R: Weibull fit,
+(C-MAPSS format)      views: train_labeled,           prognostic metrics           Kaplan-Meier,
+                      test_snapshot, lifetimes    ──▶  Python: Bayesian ridge        hazard, B10 life
+                      (RUL labeled in SQL)             + interval calibration
+```
 
-def _fmt_row(row):
-    unit = int(row[0]); cyc = int(row[1])
-    rest = " ".join(f"{v:.4f}" for v in row[2:])
-    return f"{unit} {cyc} {rest}"
+---
 
+## Build plan
 
-def main():
-    rng = np.random.default_rng(SEED)
+I am building this in layers, and each phase is a self contained step I review
+before moving on.
 
-    # ---- training set: full run-to-failure trajectories ----
-    train_rows = []
-    for u in range(1, N_TRAIN_UNITS + 1):
-        life = int(rng.integers(128, 357))          # FD001-like life range
-        train_rows.append(_make_unit(u, life, rng))
-    train = np.vstack(train_rows)
+1. **Foundation** — project scaffold and the NASA C-MAPSS FD001 data (plus a
+   synthetic generator in the same schema for offline runs).
+2. **Data layer** — SQLite schema, loader, and the SQL views that label RUL.
+3. **Modeling** — feature engineering, exploratory analysis, and the Random
+   Forest and Gradient Boosting RUL models with prognostic metrics.
+4. **Uncertainty** — a Bayesian model that returns calibrated predictive
+   intervals, not just point estimates.
+5. **Reliability** — a Weibull survival analysis of the fleet, plus final
+   documentation and a full walkthrough.
 
-    # ---- test set: trajectories truncated before failure; RUL is the remainder ----
-    test_rows = []
-    rul_truth = []
-    for u in range(1, N_TEST_UNITS + 1):
-        life = int(rng.integers(128, 357))
-        full = _make_unit(u, life, rng)
-        # cut somewhere in the second half so there is real signal but life remains
-        cut = int(rng.integers(int(life * 0.45), int(life * 0.95)))
-        test_rows.append(full[:cut])
-        rul_truth.append(life - cut)
-    test = np.vstack(test_rows)
+---
 
-    with open(os.path.join(HERE, "train_FD001.txt"), "w") as f:
-        for r in train:
-            f.write(_fmt_row(r) + " \n")
-    with open(os.path.join(HERE, "test_FD001.txt"), "w") as f:
-        for r in test:
-            f.write(_fmt_row(r) + " \n")
-    with open(os.path.join(HERE, "RUL_FD001.txt"), "w") as f:
-        for v in rul_truth:
-            f.write(f"{int(v)}\n")
+## Results
 
-    print(f"Wrote synthetic C-MAPSS FD001:")
-    print(f"  train: {train.shape[0]} rows across {N_TRAIN_UNITS} units")
-    print(f"  test:  {test.shape[0]} rows across {N_TEST_UNITS} units")
-    print(f"  RUL:   {len(rul_truth)} truth labels")
+_Populated as each phase lands. See the build plan above._
 
+---
 
-if __name__ == "__main__":
-    main()
+## Running it
+
+```bash
+pip install -r requirements.txt      # Python deps
+# R deps: base + 'survival' + 'MASS' (ship with R; no extra install)
+
+bash run_all.sh                      # full pipeline end to end
+```
+
+---
+
+## Honest notes
+
+- This uses the FD001 subset (single operating condition, one fault mode). The
+  other C-MAPSS subsets (FD002 to FD004) add operating regimes and fault modes and
+  are harder; the same pipeline extends to them.
+- The Bayesian model assumes constant Gaussian noise. That is a simplification; if
+  the noise grows sharply near end of life, a heteroscedastic model, quantile
+  regression, or conformal prediction would give better-calibrated intervals. I
+  check the calibration in the results rather than assume it.
+- No sequence model yet. An LSTM or temporal CNN over the full trajectory is the
+  natural next step and typically improves on tabular models for this dataset.
+
+---
+
+## Repository layout
+
+```
+turbofan-rul/
+├── data/            NASA C-MAPSS FD001 data + optional synthetic generator
+├── sql/             schema, loader, RUL labeling views
+├── python/          EDA, RUL models, Bayesian uncertainty, shared utils
+├── R/               Weibull / survival reliability analysis
+├── outputs/         figures + metrics.json
+├── run_all.sh       one command pipeline
+└── WALKTHROUGH.md   plain language tour of every piece
+```

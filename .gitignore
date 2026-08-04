@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated artifacts (reproducible by running the pipeline)
+outputs/cmapss.db
+outputs/lifetimes.csv
+
+# Keep the committed figures and metrics so the repo shows results on GitHub,
+# but ignore the large intermediate database.
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# OS
+.DS_Store
+Thumbs.db

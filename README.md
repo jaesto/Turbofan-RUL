@@ -53,11 +53,11 @@ every engine, and I check whether those intervals are actually calibrated. Where
 they are not, I say so in the results rather than hide it. Knowing the limits of
 a model is part of using it responsibly.
 
-**I made it reproducible with synthetic data in the real format.** The repo ships
-a clearly labeled synthetic dataset that matches the C-MAPSS FD001 schema exactly,
-so anyone can clone and run it in one command. Dropping in the official NASA files
-(same names) changes nothing in the code. I would rather be upfront that the
-default data is synthetic than quietly ship numbers that cannot be reproduced.
+**I made it fully reproducible.** The repo includes the real, public NASA C-MAPSS
+FD001 data, so anyone can clone and run the whole pipeline in one command and get
+the numbers below. A synthetic data generator in the same schema is also included
+for quick offline experiments, but the default and the reported results are the
+real data.
 
 ---
 
@@ -79,7 +79,8 @@ train/test/RUL   ──▶  SQLite: sensor_readings   ──▶  Python: RF, His
 I am building this in layers, and each phase is a self contained step I review
 before moving on.
 
-1. **Foundation** — project scaffold and a synthetic C-MAPSS data generator.
+1. **Foundation** — project scaffold and the NASA C-MAPSS FD001 data (plus a
+   synthetic generator in the same schema for offline runs).
 2. **Data layer** — SQLite schema, loader, and the SQL views that label RUL.
 3. **Modeling** — feature engineering, exploratory analysis, and the Random
    Forest and Gradient Boosting RUL models with prognostic metrics.
@@ -109,12 +110,13 @@ bash run_all.sh                      # full pipeline end to end
 
 ## Honest notes
 
-- The default dataset is synthetic, so absolute error numbers are illustrative of
-  the workflow, not a leaderboard result.
-- The Bayesian model assumes constant Gaussian noise, so its intervals are a
-  little narrow here. A heteroscedastic model, quantile regression, or conformal
-  calibration would tighten them. I left it visible because calibration is the
-  point.
+- This uses the FD001 subset (single operating condition, one fault mode). The
+  other C-MAPSS subsets (FD002 to FD004) add operating regimes and fault modes and
+  are harder; the same pipeline extends to them.
+- The Bayesian model assumes constant Gaussian noise. That is a simplification; if
+  the noise grows sharply near end of life, a heteroscedastic model, quantile
+  regression, or conformal prediction would give better-calibrated intervals. I
+  check the calibration in the results rather than assume it.
 - No sequence model yet. An LSTM or temporal CNN over the full trajectory is the
   natural next step and typically improves on tabular models for this dataset.
 
@@ -124,10 +126,10 @@ bash run_all.sh                      # full pipeline end to end
 
 ```
 turbofan-rul/
-├── data/            synthetic C-MAPSS generator + data note
+├── data/            NASA C-MAPSS FD001 data + optional synthetic generator
 ├── sql/             schema, loader, RUL labeling views
-├── src/python/      EDA, RUL models, Bayesian uncertainty, shared utils
-├── src/R/           Weibull / survival reliability analysis
+├── python/          EDA, RUL models, Bayesian uncertainty, shared utils
+├── R/               Weibull / survival reliability analysis
 ├── outputs/         figures + metrics.json
 ├── run_all.sh       one command pipeline
 └── WALKTHROUGH.md   plain language tour of every piece
